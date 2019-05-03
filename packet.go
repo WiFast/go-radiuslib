@@ -37,6 +37,7 @@ func (p *Packet) Copy() *Packet {
 }
 
 //此方法保证不修改包的内容
+//This method does not modify the contents of the package to ensure
 func (p *Packet) Encode() (b []byte, err error) {
 	p = p.Copy()
 	p.SetAVP(AVP{
@@ -50,11 +51,13 @@ func (p *Packet) Encode() (b []byte, err error) {
 		}
 	}
 	//TODO request的时候重新计算密码
+	// When the password request recalculation
 	b, err = p.encodeNoHash()
 	if err != nil {
 		return
 	}
 	//计算Message-Authenticator,Message-Authenticator被放在最后面
+	//Calculation Message-Authenticator, Message-Authenticator is placed in the rearmost
 	hasher := hmac.New(crypto.MD5.New, []byte(p.Secret))
 	hasher.Write(b)
 	copy(b[len(b)-16:len(b)], hasher.Sum(nil))
@@ -64,6 +67,8 @@ func (p *Packet) Encode() (b []byte, err error) {
 	// here only handle response part.
 	switch p.Code {
 	case AccessRequest:
+	case DisconnectRequest, DisconnectAccept, DisconnectReject:
+		fallthrough
 	case AccessAccept, AccessReject, AccessChallenge, AccountingRequest, AccountingResponse:
 		//rfc2865 page 15 Response Authenticator
 		//rfc2866 page 6 Response Authenticator
@@ -107,23 +112,30 @@ func (p *Packet) HasAVP(attrType AttributeType) bool {
 	return false
 }
 
-/*
-func (p *Packet) Attributes(attrType AttributeType) []*AVP {
-	ret := []*AVP(nil)
-	for i, _ := range p.AVPs {
-		if p.AVPs[i].Type == attrType {
-			ret = append(ret, &p.AVPs[i])
-		}
-	}
-	return ret
-}
-*/
-
 //get one avp
 func (p *Packet) GetAVP(attrType AttributeType) *AVP {
 	for i := range p.AVPs {
 		if p.AVPs[i].Type == attrType {
 			return &p.AVPs[i]
+		}
+	}
+	return nil
+}
+
+//get one vsa
+func (p *Packet) GetVSA(vendor uint32, attr uint8) *VSA {
+	for i := range p.AVPs {
+		if p.AVPs[i].Type == VendorSpecific {
+			a := p.AVPs[i]
+			vsa := new(VSA)
+			value := a.Value
+			vsa.Vendor = binary.BigEndian.Uint32(value[0:4])
+			vsa.Type = uint8(value[4])
+			vsa.Value = make([]byte, value[5]-2)
+			copy(vsa.Value, value[6:])
+			if vsa.Type == attr && vsa.Vendor == vendor {
+				return vsa
+			}
 		}
 	}
 	return nil
@@ -139,7 +151,12 @@ func (p *Packet) AddAVP(avp AVP) {
 	p.AVPs = append(p.AVPs, avp)
 }
 
+func (p *Packet) AddVSA(vsa VSA) {
+	p.AddAVP(vsa.ToAVP())
+}
+
 //删除一个AVP
+//Delete a AVP
 func (p *Packet) DeleteAVP(avp *AVP) {
 	for i := range p.AVPs {
 		if &(p.AVPs[i]) == avp {
@@ -168,39 +185,6 @@ func (p *Packet) DeleteOneType(attrType AttributeType) {
 	return
 }
 
-/*
-func (p *Packet) Valid() bool {
-	switch p.Code {
-	case AccessRequest:
-		if !(p.Has(NASIPAddress) || p.Has(NASIdentifier)) {
-			return false
-		}
-
-		if p.Has(CHAPPassword) && p.Has(UserPassword) {
-			return false
-		}
-		return true
-	case AccessAccept:
-		return true
-	case AccessReject:
-		return true
-	case AccountingRequest:
-		return true
-	case AccountingResponse:
-		return true
-	case AccessChallenge:
-		return true
-	case StatusServer:
-		return true
-	case StatusClient:
-		return true
-	case Reserved:
-		return true
-	}
-	return true
-}
-*/
-
 func (p *Packet) Reply() *Packet {
 	pac := new(Packet)
 	pac.Authenticator = p.Authenticator
@@ -220,6 +204,9 @@ func (p *Packet) Send(c net.PacketConn, addr net.Addr) error {
 }
 
 func DecodePacket(Secret string, buf []byte) (p *Packet, err error) {
+	if len(buf) < 20 {
+		return nil, errors.New("invalid length")
+	}
 	p = &Packet{Secret: Secret}
 	p.Code = PacketCode(buf[0])
 	p.Identifier = buf[1]
@@ -238,6 +225,7 @@ func DecodePacket(Secret string, buf []byte) (p *Packet, err error) {
 		b = b[length:]
 	}
 	//验证Message-Authenticator,并且通过测试验证此处算法是正确的
+	//Verify Message-Authenticator, and tested to verify the algorithm is correct here
 	err = p.checkMessageAuthenticator()
 	if err != nil {
 		return p, err
@@ -246,6 +234,7 @@ func DecodePacket(Secret string, buf []byte) (p *Packet, err error) {
 }
 
 //如果没有MessageAuthenticator也算通过
+//If no Message Authenticator can be considered by
 func (p *Packet) checkMessageAuthenticator() (err error) {
 	Authenticator := p.GetAVP(MessageAuthenticator)
 	if Authenticator == nil {
@@ -364,4 +353,44 @@ func (p *Packet) GetEAPMessage() *EapPacket {
 		return nil
 	}
 	return avp.Decode(p).(*EapPacket)
+}
+
+func (p *Packet) GetFramedIPAddress() (ip net.IP) {
+	avp := p.GetAVP(FramedIPAddress)
+	if avp == nil {
+		return nil
+	}
+	return avp.Decode(p).(net.IP)
+}
+
+func (p *Packet) GetTerminateCause() string {
+	avp := p.GetAVP(AcctTerminateCause)
+	if avp == nil {
+		return ""
+	}
+	return avp.Decode(p).(string)
+}
+
+func (p *Packet) GetCallingStationId() string {
+	avp := p.GetAVP(CallingStationId)
+	if avp == nil {
+		return ""
+	}
+	return avp.Decode(p).(string)
+}
+
+func (p *Packet) GetCalledStationId() string {
+	avp := p.GetAVP(CalledStationId)
+	if avp == nil {
+		return ""
+	}
+	return avp.Decode(p).(string)
+}
+
+func (p *Packet) GetNASPortId() string {
+	avp := p.GetAVP(NASPortId)
+	if avp == nil {
+		return ""
+	}
+	return avp.Decode(p).(string)
 }
